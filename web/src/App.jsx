@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
-  Activity, ArrowDownToLine, ArrowLeft, ArrowRight, ArrowUpRight, BookOpen,
+  Activity, ArrowDownToLine, ArrowLeft, ArrowRight, ArrowUpRight, BookOpen, BrainCircuit,
   Check, CheckCircle2, ChevronDown, CircleHelp, ClipboardCheck, Clock3,
   FileText, Gauge, LayoutDashboard, Menu, Play, Plus, Search, ShieldAlert,
   ShieldCheck, Smartphone, Upload, Video, X, XCircle, Wrench
@@ -13,6 +13,7 @@ const NAV = [
   { id: 'knowledge', label: 'Knowledge sources', icon: Upload },
   { id: 'ask', label: 'Knowledge assistant', icon: CircleHelp },
   { id: 'review', label: 'SOP review', icon: ClipboardCheck },
+  { id: 'discovery', label: 'Video analysis', icon: Video },
   { id: 'training', label: 'Training library', icon: BookOpen },
 ];
 const PAGE = {
@@ -20,6 +21,7 @@ const PAGE = {
   knowledge: ['Knowledge sources', 'CAPTURE & INDEX'],
   ask: ['Knowledge assistant', 'RETRIEVE & VERIFY'],
   review: ['SOP review studio', 'EXPERT QUALITY GATE'],
+  discovery: ['Video analysis workspace', 'ANALYZE & SYNTHESIZE'],
   training: ['Published procedures', 'APPROVED TRAINING'],
   trainingdetail: ['Guided training', 'LEARN & PRACTICE'],
 };
@@ -101,11 +103,14 @@ export default function App() {
     setSelected(procedure);
     setEdit(procedureEditor(procedure));
   };
-  const createDraft = (sourceId) => act(async () => {
+  const createDraft = (sourceId, options = {}) => act(async () => {
     const result = await request(`/api/procedures/draft/${sourceId}?language=${language}`, { method: 'POST' });
-    chooseProcedure(result); setTab('review');
+    options.onCreated?.(result);
+    if (options.open !== false) { chooseProcedure(result); setTab('review'); }
     const limited = (result.warnings || []).some((warning) => displayValue(warning).startsWith('LIMITED DRAFT:'));
-    setNotice(limited ? 'Limited draft created. Review its evidence gaps and every step before approval.' : 'Draft created. Check each step against its source before approval.');
+    setNotice(result.generation?.reused_existing_draft
+      ? `Existing source-level draft version ${result.generation.version} reused. Review it against the latest evidence before approval.`
+      : limited ? 'Limited draft created. Review its evidence gaps and every step before approval.' : 'Draft created. Check each step against its source before approval.');
   });
   const upload = (kind, file, transcriptionLanguage) => act(async () => {
     const formData = new FormData();
@@ -134,7 +139,7 @@ export default function App() {
       body: JSON.stringify({
         title: edit.title, description: edit.description,
         tools: splitLines(edit.toolsText), warnings: splitLines(edit.warningsText),
-        steps: edit.steps.map(({ instruction, timestamp, source_ref }) => ({ instruction, timestamp: timestamp || null, source_ref: source_ref || null })),
+        steps: edit.steps.map(({ instruction, timestamp, source_ref, evidence_type }) => ({ instruction, timestamp: timestamp || null, source_ref: source_ref || null, evidence_type: evidence_type || 'verification_required' })),
       }),
     });
     chooseProcedure(result); setNotice('Changes saved. The procedure still requires expert approval.');
@@ -199,6 +204,7 @@ export default function App() {
         {tab === 'knowledge' && <Knowledge sources={sources} busy={busy} loading={loading} onUpload={upload} onDraft={createDraft} transcript={transcriptDiagnostic}/>}
         {tab === 'ask' && <Assistant question={question} setQuestion={setQuestion} answer={answer} sourceType={sourceType} setSourceType={setSourceType} language={language} setLanguage={setLanguage} busy={busy} sourcesCount={sources.length} onAsk={ask}/>}
         {tab === 'review' && <Review procedures={filteredProcedures} selected={selected} edit={edit} setEdit={setEdit} search={search} setSearch={setSearch} status={procedureFilter} setStatus={setProcedureFilter} busy={busy} onChoose={chooseProcedure} onSave={saveProcedure} onReview={review}/>}
+        {tab === 'discovery' && <VideoAnalysisWorkspace sources={sources.filter((source) => source.source_type === 'video')} onDraft={createDraft} externalBusy={busy} onOpenProcedure={(procedure) => { chooseProcedure(procedure); setTab('review'); }}/>}
         {tab === 'training' && <TrainingLibrary procedures={approved} loading={loading} search={search} setSearch={setSearch} onOpen={(procedure) => { chooseProcedure(procedure); setTab('trainingdetail'); }}/>}
         {tab === 'trainingdetail' && selected && selected.status === 'approved' && <TrainingDetail key={selected.id} procedure={selected} busy={busy} onSave={(payload) => act(async () => { await request('/api/training/progress', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) }); setNotice('Training progress saved.'); })}/>}
         <footer className="footer"><span>SKILLBRIDGE AR <i>•</i> KNOWLEDGE CONTINUITY</span><span>Training instructions require local expert verification.</span></footer>
@@ -252,6 +258,90 @@ function Knowledge({ sources, busy, loading, onUpload, onDraft, transcript }) {
     </section>
   </>;
 }
+function VideoAnalysisWorkspace({ sources, onDraft, onOpenProcedure, externalBusy = false }) {
+  const [sourceId, setSourceId] = useState('');
+  const [analysis, setAnalysis] = useState(null);
+  const [timeline, setTimeline] = useState([]);
+  const [drafts, setDrafts] = useState([]);
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [draftingFullSop, setDraftingFullSop] = useState(false);
+  const [generatedVideoSop, setGeneratedVideoSop] = useState(null);
+
+  const load = async (id) => {
+    if (!id) return;
+    try {
+      const [status, events, savedDrafts] = await Promise.all([
+        request(`/api/sources/${id}/video-analysis`),
+        request(`/api/sources/${id}/evidence-timeline`),
+        request(`/api/sources/${id}/video-sop-drafts`),
+      ]);
+      setAnalysis(status);
+      setTimeline(events);
+      setDrafts(savedDrafts.video_sop_drafts || []);
+      setError('');
+    } catch (err) {
+      setError(err.message);
+    }
+  };
+  useEffect(() => { setGeneratedVideoSop(null); setAnalysis(null); setTimeline([]); setDrafts([]); if (sourceId) load(sourceId); }, [sourceId]);
+  useEffect(() => {
+    if (!sourceId || !['pending','running','extracting_frames','analysing_frames','aligning_evidence','indexing'].includes(analysis?.status)) return;
+    const timer = setInterval(() => load(sourceId), 4000);
+    return () => clearInterval(timer);
+  }, [sourceId, analysis?.status]);
+  const act = async (fn) => { setBusy(true); setError(''); try { await fn(); } catch (err) { setError(err.message); } finally { setBusy(false); } };
+  const start = () => act(async () => { await request(`/api/sources/${sourceId}/video-analysis`, { method: 'POST' }); await load(sourceId); });
+  const running = ['pending','running','extracting_frames','analysing_frames','aligning_evidence','indexing'].includes(analysis?.status);
+  const metrics = analysis?.metrics || {};
+  const fullDraft = generatedVideoSop || drafts[0] || null;
+  const draftManifest = fullDraft?.generation?.evidence_manifest || fullDraft?.evidence_manifest || [];
+  const draftWarnings = [...(fullDraft?.procedure?.warnings || fullDraft?.warnings || []), ...(fullDraft?.generation?.coverage_warnings || [])]
+    .filter((warning, index, items) => items.findIndex((item) => displayValue(item) === displayValue(warning)) === index);
+  const draftEvidenceCounts = fullDraft?.generation?.evidence_counts || {
+    transcript_segments: draftManifest.filter((item) => ['transcript_chunk', 'window_transcript'].includes(item.kind)).length,
+  };
+  const generateFullVideoSop = async () => {
+    if (!sourceId || draftingFullSop || externalBusy) return;
+    setDraftingFullSop(true);
+    setError('');
+    try {
+      await onDraft(Number(sourceId), { open: false, onCreated: setGeneratedVideoSop });
+      await load(sourceId);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setDraftingFullSop(false);
+    }
+  };
+
+  return <>
+    <PageIntro title="Inspect the recording and draft from its transcript." text="Video analysis remains available for visual inspection. Full-video SOP drafts use only the selected source’s stored timestamped transcript; visual observations, analysis coverage, and expert records do not affect generation."/>
+    <section className="surface discovery-toolbar">
+      <label className="form-control"><span>VIDEO SOURCE</span><select value={sourceId} onChange={(event) => setSourceId(event.target.value)}><option value="">Select a video source</option>{sources.map((source) => <option key={source.id} value={source.id}>{source.filename} · source {source.id}</option>)}</select></label>
+      {sourceId && <><span className="status status-draft">{analysis?.status || 'loading'}</span><button className="button button-primary" disabled={busy || running || analysis?.status === 'completed'} onClick={start}><BrainCircuit size={15}/>{analysis?.status === 'failed' || analysis?.status === 'partially_completed' ? 'Resume analysis' : 'Analyze video'}</button></>}
+    </section>
+    {error && <div className="message message-error" role="alert"><XCircle size={15}/>{error}</div>}
+    {analysis && <div className="analysis-progress"><span>{analysis.status === 'failed' ? `Analysis failed during ${analysis.stage || 'processing'}: ${analysis.error}` : `${analysis.stage || analysis.status} · ${analysis.progress || 0}%`}</span><div><i style={{ width: `${analysis.progress || 0}%` }}/></div><small>{metrics.motion_scan_samples ?? 0} motion samples at {metrics.motion_scan_fps ? Number(metrics.motion_scan_fps).toFixed(2) : '—'} fps · baseline interval {metrics.candidate_baseline_interval_seconds ? `${Number(metrics.candidate_baseline_interval_seconds).toFixed(1)}s` : '—'} · {metrics.candidate_count ?? 0} candidates · {metrics.windows_selected ?? 0} windows · {metrics.detailed_frames_completed ?? 0}/{metrics.detailed_frames_selected ?? 0} detailed frames · {metrics.candidate_windows_screened_out ?? 0} lower-priority windows screened out · {metrics.candidate_windows_not_detailed ?? 0} important or failed windows not detailed · {metrics.vision_requests_completed ?? 0} vision batches</small>{analysis.warnings?.length > 0 && <ul>{analysis.warnings.map((warning, index) => <li key={index}>{warning}</li>)}</ul>}</div>}
+    {sourceId && <>
+      <section className="surface timeline-panel" id="video-evidence">
+        <SectionHeading title="Video analysis timeline" detail="Inspect transcript timing, visual observations, and coverage here. Visual analysis is not used to generate SOP drafts."/>
+        {analysis?.contact_sheets?.length > 0 && <div className="contact-sheet-list"><h3>Coarse screening sheets</h3>{analysis.contact_sheets.map((sheet) => <figure key={sheet.number}><img src={`${API}${sheet.url}`} alt={`Candidate frames contact sheet ${sheet.number}`} loading="lazy"/><figcaption>Screening sheet {sheet.number} · candidate labels map to the timestamps below</figcaption></figure>)}</div>}
+        {timeline.length ? <div className="evidence-timeline">{timeline.map((entry, index) => entry.kind === 'action_window'
+          ? <article className="evidence-entry action-window" key={`window-${entry.window_id}`}><time>{Number(entry.timestamp_start).toFixed(1)}–{Number(entry.timestamp_end).toFixed(1)}s</time><div className="evidence-entry-content"><b>Candidate action window · {entry.status}</b><p>{entry.selection_reason}</p>{entry.transcript_segments?.map((segment, segmentIndex) => <p key={segmentIndex}><b>Transcript</b> {segment.text}</p>)}{entry.summary?.sequence_summary && <p><b>Unverified visual sequence summary</b> {entry.summary.sequence_summary}</p>}{entry.summary?.uncertainties?.length > 0 && <p><b>Uncertainty</b> {entry.summary.uncertainties.join(' · ')}</p>}{entry.comparison?.explanation && <p><b>SOP comparison · {entry.comparison.relationship}</b> {entry.comparison.explanation}</p>}</div></article>
+          : <article className="evidence-entry" key={`${entry.frame_id || entry.timestamp_start}-${index}`}><time>{Number(entry.timestamp_start).toFixed(1)}s</time>{entry.frame_url && <img src={`${API}${entry.frame_url}`} alt={`Frame at ${entry.timestamp_start} seconds`} loading="lazy"/>}<div className="evidence-entry-content">{entry.candidate && <small>Candidate score {Number(entry.candidate.score).toFixed(2)} · {entry.candidate.selected_for_detail ? 'selected for detailed analysis' : entry.candidate.is_contact_sample ? 'contact sheet only' : 'coverage sample'} · {entry.candidate.selection_reason || entry.candidate.reasons?.join(', ')}</small>}{entry.frame_status === 'failed' && <p>Visual analysis failed for this frame. Retry will preserve other completed frames.</p>}{entry.audio_text && <div><b>Transcript</b><p>{entry.audio_text}</p></div>}{entry.visual?.description && <div><b>AI visual observation · unverified</b><p>{entry.visual.description}</p></div>}{entry.visual?.uncertainties?.length > 0 && <div><b>Uncertainty</b><p>{entry.visual.uncertainties.join(' · ')}</p></div>}{entry.sequence && <div><b>Sampled sequence · not continuous motion</b><p>{[...(entry.sequence.visible_changes || []), ...(entry.sequence.suggested_but_unproven || []).map((item) => `Unproven: ${item}`)].join(' · ')}</p></div>}</div></article>
+        )}</div> : <EmptyState icon={Video} title="No visual timeline yet" text={analysis?.status === 'failed' ? 'Transcript data remains available; resume analysis to continue visual coverage.' : 'Analyze this video to populate timestamped transcript and visual evidence.'}/>}
+      </section>
+      <section className="surface video-sop-workspace">
+        <SectionHeading title="Full-video SOP draft" detail={`Source ${sourceId} · transcript-only generation. ${analysis?.run_id ? `Analysis run ${analysis.run_id} is retained for inspection separately.` : 'Video analysis is optional and does not gate drafting.'}`}/>
+        {fullDraft && <article className="expert-question video-sop-result"><div className="question-meta"><span>Full-video draft · version {fullDraft.generation?.version ?? fullDraft.version}</span><Status value={fullDraft.status || fullDraft.procedure?.status || 'draft'}/>{(fullDraft.generation?.run_id ?? fullDraft.run_id) != null && <span>Analysis provenance run {fullDraft.generation?.run_id ?? fullDraft.run_id}</span>}</div><strong>{fullDraft.title || fullDraft.procedure?.title}</strong><p>{fullDraft.description || fullDraft.procedure?.description}</p>{draftWarnings.map((warning, index) => <div className="review-callout" key={index}><ShieldAlert size={15}/><span>{displayValue(warning)}</span></div>)}<small>{Object.entries(draftEvidenceCounts).map(([key, value]) => `${key.replaceAll('_', ' ')}: ${value}`).join(' · ')}</small>{draftManifest.length > 0 && <details className="draft-evidence"><summary>Supporting transcript references ({draftManifest.length})</summary><ul>{draftManifest.map((item, index) => <li key={`${item.kind}-${item.id}-${index}`}><span>{item.kind.replaceAll('_', ' ')}</span><a href="#video-evidence">{item.source_ref}</a>{item.timestamp && <small>{item.timestamp}</small>}</li>)}</ul></details>}<button className="button button-outline button-small" disabled={externalBusy} onClick={() => onOpenProcedure(fullDraft.procedure || fullDraft)}><ClipboardCheck size={14}/> Open in SOP review</button></article>}
+        {drafts.slice(1).map((item) => <article className="legacy-proposal" key={`video-sop-${item.version}`}><b>Version {item.version} · {item.procedure.status}</b><span>{item.procedure.title} · run {item.run_id}</span><button className="button button-outline button-small" onClick={() => onOpenProcedure(item.procedure)}>Open version</button></article>)}
+        <div className="discovery-sop"><div><b>Generate Full Video SOP Draft</b><p>Uses only this video’s timestamped transcript. Visual analysis is displayed above for inspection and never changes the draft. Drafts remain unapproved; unchanged transcripts reuse their existing version.</p></div><button className="button button-primary" disabled={busy || externalBusy || draftingFullSop || !sourceId} onClick={generateFullVideoSop}>{draftingFullSop || externalBusy ? <><span className="spinner"/> Generating…</> : <><ClipboardCheck size={15}/> Generate Full Video SOP Draft</>}</button></div>
+      </section>
+    </>}
+  </>;
+}
+
 function UploadCard({ kind, title, detail, formats, busy, onUpload }) {
   const [file, setFile] = useState(null);
   const [language, setLanguage] = useState('auto');
@@ -308,7 +398,7 @@ function Review({ procedures, selected, edit, setEdit, search, setSearch, status
       <label className="form-control"><span>DESCRIPTION</span><textarea rows="3" value={edit.description} onChange={(event) => setEdit({ ...edit, description: event.target.value })}/></label>
       <div className="editor-columns"><label className="form-control"><span>REQUIRED TOOLS <i>· one per line</i></span><textarea rows="4" value={edit.toolsText} onChange={(event) => setEdit({ ...edit, toolsText: event.target.value })} placeholder="Verify tools against the source"/></label><label className="form-control"><span>SAFETY NOTES <i>· one per line</i></span><textarea rows="4" value={edit.warningsText} onChange={(event) => setEdit({ ...edit, warningsText: event.target.value })} placeholder="Confirm warnings with an expert"/></label></div>
       <div className="steps-editor-heading"><div><h3>Procedure steps</h3><p>Source references stay attached to their step when you edit.</p></div><button className="button button-outline button-small" onClick={() => setEdit((state) => ({ ...state, steps: [...state.steps, { instruction: '', timestamp: null, source_ref: null }] }))}><Plus size={14}/> Add step</button></div>
-      <div className="steps-editor">{edit.steps.map((step, index) => <div className="edit-step" key={`${selected.id}-${index}`}><span className="step-index">{String(index + 1).padStart(2, '0')}</span><div className="step-edit-fields"><label className="sr-only" htmlFor={`step-${index}`}>Step {index + 1} instruction</label><textarea id={`step-${index}`} rows="2" value={step.instruction || ''} onChange={(event) => updateStep(index, 'instruction', event.target.value)} placeholder="Enter the reviewed instruction"/><div className="step-source-fields"><label>Source reference<input value={step.source_ref || ''} onChange={(event) => updateStep(index, 'source_ref', event.target.value || null)} placeholder="Manual page or video reference"/></label><label>Timestamp<input value={step.timestamp || ''} onChange={(event) => updateStep(index, 'timestamp', event.target.value || null)} placeholder="e.g. 01:24"/></label></div></div><button className="icon-button remove-step" aria-label={`Remove step ${index + 1}`} onClick={() => setEdit((state) => ({ ...state, steps: state.steps.filter((_, stepIndex) => stepIndex !== index) }))}><X size={15}/></button></div>)}{edit.steps.length === 0 && <p className="no-steps">Add a step after checking the source material.</p>}</div>
+      <div className="steps-editor">{edit.steps.map((step, index) => <div className="edit-step" key={`${selected.id}-${index}`}><span className="step-index">{String(index + 1).padStart(2, '0')}</span><div className="step-edit-fields"><label className="sr-only" htmlFor={`step-${index}`}>Step {index + 1} instruction</label><textarea id={`step-${index}`} rows="2" value={step.instruction || ''} onChange={(event) => updateStep(index, 'instruction', event.target.value)} placeholder="Enter the reviewed instruction"/><div className="step-source-fields"><label>Source reference<input value={step.source_ref || ''} onChange={(event) => updateStep(index, 'source_ref', event.target.value || null)} placeholder="Manual page or video reference"/></label><label>Timestamp<input value={step.timestamp || ''} onChange={(event) => updateStep(index, 'timestamp', event.target.value || null)} placeholder="e.g. 01:24"/></label></div><label className="evidence-kind">Evidence classification<select value={step.evidence_type || 'verification_required'} onChange={(event) => updateStep(index, 'evidence_type', event.target.value)}><option value="source_supported">Source supported</option><option value="visual_observation">Visual observation</option><option value="expert_confirmed">Expert confirmed</option><option value="approved_sop_reference">Approved SOP reference</option><option value="ai_inferred">AI inferred</option><option value="verification_required">Verification required</option></select></label></div><button className="icon-button remove-step" aria-label={`Remove step ${index + 1}`} onClick={() => setEdit((state) => ({ ...state, steps: state.steps.filter((_, stepIndex) => stepIndex !== index) }))}><X size={15}/></button></div>)}{edit.steps.length === 0 && <p className="no-steps">Add a step after checking the source material.</p>}</div>
       <div className="editor-actions"><button className="button button-outline" onClick={onSave} disabled={busy || !edit.title.trim()}>{busy ? <span className="spinner"/> : <Check size={15}/>} Save changes</button><span className="action-spacer"/>{selected.status !== 'approved' && <button className="button button-danger-outline" onClick={() => changeReview('reject')} disabled={busy}><XCircle size={15}/> Reject</button>}<button className="button button-primary" onClick={() => changeReview('approve')} disabled={busy || selected.status === 'approved' || !edit.steps.length || edit.steps.some((step) => !step.instruction?.trim())}><ShieldCheck size={16}/> Approve & publish</button></div>
     </> : <EmptyState icon={ClipboardCheck} title="Select a procedure to review" text="Drafts, approved procedures, and rejected items are listed here."/>}</section></div>
   </>;
@@ -334,7 +424,7 @@ function TrainingDetail({ procedure, busy, onSave }) {
   const arLink = `${AR_URL}?title=${encodeURIComponent(procedure.title)}&step=${encodeURIComponent(current?.instruction || 'Follow the approved procedure.')}&warning=${encodeURIComponent(displayValue(procedure.warnings?.[0]) || 'Follow site safety requirements.')}`;
   return <div className="training-detail"><div className="training-detail-title"><div><span className="status status-approved">APPROVED PROCEDURE</span><h2>{procedure.title}</h2><p>{procedure.description}</p></div><span className="detail-id">SOP {procedure.id}</span></div>
     <div className="training-detail-grid"><section className="surface instruction-panel"><div className="step-overview"><div><span className="overline">CURRENT INSTRUCTION</span><strong>Step {steps.length ? index + 1 : 0} <i>/</i> {steps.length}</strong></div><div className="progress-copy">{percent}% reviewed</div></div><div className="progress-track"><span style={{ width: `${percent}%` }}/></div>
-      {current ? <div className="active-instruction"><span className="active-step-num">{String(index + 1).padStart(2, '0')}</span><div><span className="overline">INSTRUCTION</span><p>{current.instruction}</p>{(current.timestamp || current.source_ref) && <div className="instruction-source"><FileText size={14}/><span>{current.source_ref || 'Source reference'}{current.timestamp ? ` · ${current.timestamp}` : ''}</span></div>}</div></div> : <EmptyState title="No procedure steps" text="Return to the review studio to check this procedure."/>}
+      {current ? <div className="active-instruction"><span className="active-step-num">{String(index + 1).padStart(2, '0')}</span><div><span className="overline">INSTRUCTION · {(current.evidence_type || 'verification_required').replaceAll('_', ' ').toUpperCase()}</span><p>{current.instruction}</p>{(current.timestamp || current.source_ref) && <div className="instruction-source"><FileText size={14}/><span>{current.source_ref || 'Source reference'}{current.timestamp ? ` · ${current.timestamp}` : ''}</span></div>}</div></div> : <EmptyState title="No procedure steps" text="Return to the review studio to check this procedure."/>}
       <label className="training-check"><input type="checkbox" checked={checked.includes(index)} disabled={!current} onChange={(event) => setChecked(event.target.checked ? [...checked, index] : checked.filter((value) => value !== index))}/><span className="fake-check"><Check size={13}/></span>I have reviewed this instruction</label>
       <div className="step-navigation"><button className="button button-outline" disabled={index === 0} onClick={() => setIndex(index - 1)}><ArrowLeft size={15}/> Previous</button><span>{checked.length} of {steps.length} steps reviewed</span><button className="button button-dark" disabled={index >= steps.length - 1} onClick={() => setIndex(index + 1)}>Next step <ArrowRight size={15}/></button></div>
       <a className="ar-launch" href={arLink} target="_blank" rel="noreferrer"><span className="ar-launch-icon"><Smartphone size={19}/></span><span><strong>Open AR guidance</strong><small>View the active step in the configured AR experience</small></span><ArrowUpRight size={17}/></a>
